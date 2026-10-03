@@ -19,7 +19,7 @@ from pyrogram import Client, filters, enums, idle
 from pyrogram.errors import FloodWait
 from pyrogram.file_id import FileId
 
-logging.getLogger("pyrogram").setLevel(logging.ERROR)
+logging.getLogger("pyrogram").setLevel(logging.CRITICAL)  # get_file retries are handled in fast_download
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
@@ -116,14 +116,21 @@ async def fast_download(client, media, path, task_id, progress):
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC)
     os.ftruncate(fd, size)
     done = [0]
+    setup_lock = asyncio.Lock()
 
     async def worker(pos, end):
         fails = 0
         while pos < end and task_id not in cancelled:
             before = pos
+            # Telegram only honours the LAST exported auth for a foreign DC, so connections must be set up one at a time.
+            await setup_lock.acquire()
+            held = True
             gen = client.get_file(fid, size, limit=end - pos, offset=pos)
             try:
                 async for data in gen:
+                    if held:
+                        setup_lock.release()
+                        held = False
                     if task_id in cancelled:
                         return
                     os.pwrite(fd, data, pos * CHUNK)
@@ -137,6 +144,8 @@ async def fast_download(client, media, path, task_id, progress):
                     raise
                 await asyncio.sleep(2)
             finally:
+                if held:
+                    setup_lock.release()
                 with contextlib.suppress(Exception):
                     await gen.aclose()
             if pos == before:
