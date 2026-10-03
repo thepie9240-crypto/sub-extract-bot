@@ -15,9 +15,10 @@ import re
 import shutil
 import time
 
-from pyrogram import Client, filters, enums, idle
+from pyrogram import Client, filters, enums, idle, raw
 from pyrogram.errors import FloodWait
 from pyrogram.file_id import FileId
+from pyrogram.session import Auth, Session
 
 logging.getLogger("pyrogram").setLevel(logging.CRITICAL)  # get_file retries are handled in fast_download
 
@@ -29,7 +30,8 @@ os.makedirs(WORK_DIR, exist_ok=True)
 
 VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".webm", ".flv", ".mov", ".m4v", ".ts", ".wmv", ".mpg", ".mpeg")
 UI_INTERVAL = 2.5
-DL_WORKERS = 12          # parallel Telegram connections for downloading (each streams its own part of the file)
+DL_WORKERS = 8           # parallel Telegram connections for downloading
+PER_CONN = 3             # requests in flight per connection
 CHUNK = 1024 * 1024
 
 # codec -> (output extension, ffmpeg subtitle codec)
@@ -52,8 +54,7 @@ app = Client(
     bot_token=BOT_TOKEN,
     workers=16,
     sleep_threshold=60,
-    max_concurrent_transmissions=DL_WORKERS,
-    in_memory=True,
+        in_memory=True,
 )
 
 # Videos are processed one at a time, in the order they arrive (keeps forwarded batches in order).
@@ -107,68 +108,97 @@ async def safe_call(coro_fn, *args, **kwargs):
     return None
 
 
+dc_auth_keys = {}   # dc_id -> auth key that is already authorised for this bot (so we export/import only ONCE per DC)
+
+
+async def open_dl_sessions(client, dc_id, count):
+    """Open `count` media connections to the file's DC that all share ONE authorised auth key."""
+    test_mode = await client.storage.test_mode()
+    mk = lambda key: Session(client, dc_id, key, test_mode, is_media=True)
+
+    if dc_id == await client.storage.dc_id():
+        key, first = await client.storage.auth_key(), None
+    elif dc_id in dc_auth_keys:
+        key, first = dc_auth_keys[dc_id], None
+    else:
+        key = await Auth(client, dc_id, test_mode).create()
+        first = mk(key)
+        await first.start()
+        while True:
+            try:
+                exported = await client.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+                break
+            except FloodWait as e:
+                await asyncio.sleep(int(getattr(e, "value", 0) or 0) + 1)
+        await first.invoke(raw.functions.auth.ImportAuthorization(id=exported.id, bytes=exported.bytes))
+        dc_auth_keys[dc_id] = key
+
+    rest = [mk(key) for _ in range(count - (1 if first else 0))]
+    results = await asyncio.gather(*[x.start() for x in rest], return_exceptions=True)
+    sessions = ([first] if first else []) + [x for x, r in zip(rest, results) if not isinstance(r, Exception)]
+    if not sessions:
+        raise RuntimeError("Could not open any download connection")
+    return sessions
+
+
 async def fast_download(client, media, path, task_id, progress):
-    """Download with DL_WORKERS parallel connections, each streaming its own slice of the file."""
+    """Parallel download: N connections x PER_CONN requests in flight, 1 MiB pieces written straight to disk."""
     fid, size = FileId.decode(media.file_id), media.file_size
-    chunks = math.ceil(size / CHUNK)
-    workers = max(1, min(DL_WORKERS, chunks))
-    per = math.ceil(chunks / workers)
+    location = raw.types.InputDocumentFileLocation(
+        id=fid.media_id, access_hash=fid.access_hash,
+        file_reference=fid.file_reference, thumb_size=fid.thumbnail_size,
+    )
+    total = math.ceil(size / CHUNK)
+    sessions = await open_dl_sessions(client, fid.dc_id, min(DL_WORKERS, total))
+    queue = asyncio.Queue()
+    for i in range(total):
+        queue.put_nowait(i)
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC)
     os.ftruncate(fd, size)
     done = [0]
-    setup_lock = asyncio.Lock()
+    stop = asyncio.Event()
 
-    async def worker(pos, end):
-        fails = 0
-        while pos < end and task_id not in cancelled:
-            before = pos
-            # Telegram only honours the LAST exported auth for a foreign DC, so connections must be set up one at a time.
-            await setup_lock.acquire()
-            held = True
-            gen = client.get_file(fid, size, limit=end - pos, offset=pos)
+    async def worker(session):
+        while not stop.is_set() and task_id not in cancelled:
             try:
-                async for data in gen:
-                    if held:
-                        setup_lock.release()
-                        held = False
-                    if task_id in cancelled:
-                        return
-                    os.pwrite(fd, data, pos * CHUNK)
-                    pos += 1
-                    done[0] += len(data)
-            except FloodWait as e:
-                await asyncio.sleep(int(getattr(e, "value", 0) or 0) + 1)
-            except Exception:
-                fails += 1
-                if fails > 6:
-                    raise
-                await asyncio.sleep(2)
-            finally:
-                if held:
-                    setup_lock.release()
-                with contextlib.suppress(Exception):
-                    await gen.aclose()
-            if pos == before:
-                fails += 1
-                if fails > 6:
-                    raise RuntimeError("Download stalled")
+                idx = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            for attempt in range(8):
+                try:
+                    r = await session.invoke(
+                        raw.functions.upload.GetFile(location=location, offset=idx * CHUNK, limit=CHUNK),
+                        sleep_threshold=30,
+                    )
+                    os.pwrite(fd, r.bytes, idx * CHUNK)
+                    done[0] += len(r.bytes)
+                    break
+                except FloodWait as e:
+                    await asyncio.sleep(int(getattr(e, "value", 0) or 0) + 1)
+                except Exception:
+                    if attempt == 7:
+                        stop.set()
+                        raise
+                    await asyncio.sleep(1 + attempt)
 
-    tasks = [asyncio.create_task(worker(i * per, min((i + 1) * per, chunks))) for i in range(workers) if i * per < chunks]
+    tasks = [asyncio.create_task(worker(s)) for s in sessions for _ in range(PER_CONN)]
     try:
         while not all(t.done() for t in tasks):
             await asyncio.sleep(1)
             await progress(done[0], size)
             for t in tasks:
-                if t.done() and t.exception():
+                if t.done() and not t.cancelled() and t.exception():
                     raise t.exception()
         for t in tasks:
             t.result()
         if task_id not in cancelled and done[0] != size:
             raise RuntimeError(f"Download incomplete: {done[0]} / {size}")
     finally:
+        stop.set()
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*[x.stop() for x in sessions], return_exceptions=True)
         os.close(fd)
     return path
 
