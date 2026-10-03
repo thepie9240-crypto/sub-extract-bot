@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -16,6 +17,7 @@ import time
 
 from pyrogram import Client, filters, enums, idle
 from pyrogram.errors import FloodWait
+from pyrogram.file_id import FileId
 
 logging.getLogger("pyrogram").setLevel(logging.ERROR)
 
@@ -27,6 +29,8 @@ os.makedirs(WORK_DIR, exist_ok=True)
 
 VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".webm", ".flv", ".mov", ".m4v", ".ts", ".wmv", ".mpg", ".mpeg")
 UI_INTERVAL = 2.5
+DL_WORKERS = 12          # parallel Telegram connections for downloading (each streams its own part of the file)
+CHUNK = 1024 * 1024
 
 # codec -> (output extension, ffmpeg subtitle codec)
 TEXT_SUBS = {
@@ -35,11 +39,11 @@ TEXT_SUBS = {
     "ass": (".ass", "copy"),
     "ssa": (".ssa", "copy"),
     "webvtt": (".vtt", "copy"),
-    "mov_text": (".srt", "srt"),
-    "text": (".srt", "srt"),
 }
-# Bitmap subtitles can't become text, but PGS can still be dumped as .sup
+# Bitmap subtitles can't become text; PGS can still be dumped as .sup
 IMAGE_SUBS = {"hdmv_pgs_subtitle": ".sup"}
+UNSUPPORTED = {"dvd_subtitle", "dvb_subtitle", "xsub"}
+# Any other text-like codec (mov_text, microdvd, sami, ...) is converted to SRT.
 
 app = Client(
     "sub_extract_bot",
@@ -48,6 +52,7 @@ app = Client(
     bot_token=BOT_TOKEN,
     workers=16,
     sleep_threshold=60,
+    max_concurrent_transmissions=DL_WORKERS,
     in_memory=True,
 )
 
@@ -100,6 +105,63 @@ async def safe_call(coro_fn, *args, **kwargs):
         except FloodWait as e:
             await asyncio.sleep(int(getattr(e, "value", 0) or 0) + 1)
     return None
+
+
+async def fast_download(client, media, path, task_id, progress):
+    """Download with DL_WORKERS parallel connections, each streaming its own slice of the file."""
+    fid, size = FileId.decode(media.file_id), media.file_size
+    chunks = math.ceil(size / CHUNK)
+    workers = max(1, min(DL_WORKERS, chunks))
+    per = math.ceil(chunks / workers)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC)
+    os.ftruncate(fd, size)
+    done = [0]
+
+    async def worker(pos, end):
+        fails = 0
+        while pos < end and task_id not in cancelled:
+            before = pos
+            gen = client.get_file(fid, size, limit=end - pos, offset=pos)
+            try:
+                async for data in gen:
+                    if task_id in cancelled:
+                        return
+                    os.pwrite(fd, data, pos * CHUNK)
+                    pos += 1
+                    done[0] += len(data)
+            except FloodWait as e:
+                await asyncio.sleep(int(getattr(e, "value", 0) or 0) + 1)
+            except Exception:
+                fails += 1
+                if fails > 6:
+                    raise
+                await asyncio.sleep(2)
+            finally:
+                with contextlib.suppress(Exception):
+                    await gen.aclose()
+            if pos == before:
+                fails += 1
+                if fails > 6:
+                    raise RuntimeError("Download stalled")
+
+    tasks = [asyncio.create_task(worker(i * per, min((i + 1) * per, chunks))) for i in range(workers) if i * per < chunks]
+    try:
+        while not all(t.done() for t in tasks):
+            await asyncio.sleep(1)
+            await progress(done[0], size)
+            for t in tasks:
+                if t.done() and t.exception():
+                    raise t.exception()
+        for t in tasks:
+            t.result()
+        if task_id not in cancelled and done[0] != size:
+            raise RuntimeError(f"Download incomplete: {done[0]} / {size}")
+    finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        os.close(fd)
+    return path
 
 
 async def probe_subtitles(path):
@@ -190,8 +252,6 @@ async def process_video(client, message, status, media, filename, task_id, work,
     last_edit = [0.0]
 
     async def progress(current, total):
-        if task_id in cancelled:
-            client.stop_transmission()
         now = time.time()
         if now - last_edit[0] < UI_INTERVAL and current < total:
             return
@@ -210,8 +270,8 @@ async def process_video(client, message, status, media, filename, task_id, work,
             )
 
     video_path = os.path.join(work, safe_name(filename))
-    path = await client.download_media(message, file_name=video_path, progress=progress)
-    if task_id in cancelled or not path:
+    path = await fast_download(client, media, video_path, task_id, progress)
+    if task_id in cancelled:
         await status.edit_text("🚫 <b>Cancelled.</b>", parse_mode=enums.ParseMode.HTML)
         return
 
@@ -225,9 +285,9 @@ async def process_video(client, message, status, media, filename, task_id, work,
         )
         return
 
-    # ---- 3. extract + send, in track order ----
+    # ---- 3. extract every track, then free the disk (video is deleted before uploading) ----
     base = os.path.splitext(safe_name(filename))[0]
-    sent, skipped = 0, []
+    extracted, skipped = [], []
 
     for n, st in enumerate(tracks, start=1):
         if task_id in cancelled:
@@ -243,9 +303,11 @@ async def process_video(client, message, status, media, filename, task_id, work,
             ext, ffcodec = TEXT_SUBS[codec]
         elif codec in IMAGE_SUBS:
             ext, ffcodec = IMAGE_SUBS[codec], "copy"
-        else:
+        elif codec in UNSUPPORTED:
             skipped.append(f"#{n} ({codec})")
             continue
+        else:
+            ext, ffcodec = ".srt", "srt"
 
         await status.edit_text(
             f"⚙️ <b>Extracting subtitle {n}/{len(tracks)}</b>\n<code>{lang} • {codec}</code>",
@@ -258,8 +320,15 @@ async def process_video(client, message, status, media, filename, task_id, work,
             skipped.append(f"#{n} ({codec})")
             print(f"[ERROR] track {n} failed: {err}")
             continue
-
         caption = f"<b>Track {n}/{len(tracks)}</b> • <code>{lang}</code> • {codec.upper()}" + (f"\n<i>{title}</i>" if title else "")
+        extracted.append((out_path, caption))
+
+    with contextlib.suppress(Exception):
+        os.remove(path)          # video no longer needed -> free Colab SSD
+
+    # ---- 4. send in order ----
+    sent = 0
+    for out_path, caption in extracted:
         await safe_call(
             client.send_document, message.chat.id, out_path,
             caption=caption, parse_mode=enums.ParseMode.HTML, reply_to_message_id=message.id,
